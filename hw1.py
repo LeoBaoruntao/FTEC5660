@@ -62,8 +62,18 @@ def build_chain() -> Any:
     Use the vision-capable DeepSeek Flash model named
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You read Hong Kong supermarket receipts precisely. Return ONLY one JSON object with exactly these three string fields: paid, subtotal, discounts. Use two decimal places and no currency symbols. paid is the final bill total AFTER ROUNDING, not cash tendered, change, or a loyalty balance. If payment is split across methods, add actual payments for this receipt. subtotal is the printed SUBTOTAL after all discounts but BEFORE ROUNDING. discounts is the sum of the absolute values of EVERY discount, promotion, coupon, member, app, packaging-damage, and percentage-off line on the receipt. Never include ROUNDING in discounts. A negative discount is counted as a positive number. Do not treat individual product prices, savings summaries, or tendered cash as extra discounts. Check that subtotal plus discounts equals the original pre-discount item total when that is visible. If a field cannot be read directly, infer it carefully using visible arithmetic. Return numeric strings, for example paid 102.30, subtotal 102.31, discounts 5.39."""),
+        ("human", [
+            {"type": "text", "text": "Extract the three amounts from this one receipt. Inspect the entire image, including small promotion lines and the bottom payment and rounding lines. Output JSON only."},
+            {"type": "image_url", "image_url": {"url": "{image_url}"}},
+        ]),
+    ])
+    model = ChatDeepSeek(model="deepseek-v4-flash-vision-exp", temperature=0, max_retries=2)
+    return prompt | model
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -78,9 +88,53 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     multimodal human messages. LangChain's ``batch`` method is one simple way
     to process independent receipt-extraction prompts in parallel.
     """
-    ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    import time
+
+    def parse_receipt(result: Any) -> tuple[Decimal, Decimal]:
+        content = result.content if hasattr(result, "content") else result
+        if isinstance(content, list):
+            content = " ".join(
+                part if isinstance(part, str) else part.get("text", "")
+                for part in content if isinstance(part, (str, dict))
+            )
+        content = str(content).strip()
+        match = re.search(r"\{[\s\S]*?\}", content)
+        if not match:
+            raise ValueError("No JSON object in receipt extraction")
+        data = json.loads(match.group(0))
+
+        def money(field: str) -> Decimal:
+            value = str(data[field]).replace("HK$", "").replace("$", "").replace(",", "").strip()
+            amount = Decimal(value).quantize(Decimal("0.01"))
+            if not amount.is_finite() or abs(amount) > Decimal("10000000"):
+                raise ValueError(f"Invalid {field} amount")
+            return amount
+
+        paid = money("paid")
+        subtotal = money("subtotal")
+        discounts = abs(money("discounts"))
+        if paid < 0 or subtotal < 0:
+            raise ValueError("Negative receipt total")
+        return paid, subtotal + discounts
+
+    spent = Decimal("0.00")
+    full_price = Decimal("0.00")
+    for path in images:
+        # Independent receipts are processed separately; no public answers or
+        # filenames are embedded in the solution.
+        payload = {"image_url": image_data_url(path)}
+        for attempt in range(3):
+            try:
+                paid, original = parse_receipt(chain.invoke(payload))
+                spent += paid
+                full_price += original
+                break
+            except (ValueError, KeyError, InvalidOperation, json.JSONDecodeError):
+                if attempt == 2:
+                    raise
+                time.sleep(1 + attempt)
+
+    return {QUERY_1: f"HK${spent:.2f}", QUERY_2: f"HK${full_price:.2f}"}
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
@@ -186,3 +240,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
